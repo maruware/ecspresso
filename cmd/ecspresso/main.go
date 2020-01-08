@@ -98,6 +98,17 @@ func _main() int {
 		ServiceDefinitionPath: init.Flag("service-definition-path", "output service definition file path").Default("ecs-service-def.json").String(),
 	}
 
+	schedule := kingpin.Command("schedule", "schedule task with cloudwatch event")
+	scheduleOption := ecspresso.ScheduleOption{
+		DryRun:             schedule.Flag("dry-run", "dry-run").Bool(),
+		TaskDefinition:     schedule.Flag("task-def", "task definition json for run task").String(),
+		TaskOverrideStr:    schedule.Flag("overrides", "task overrides JSON string").Default("").String(),
+		SkipTaskDefinition: schedule.Flag("skip-task-definition", "skip register a new task definition").Bool(),
+		EventName:          schedule.Flag("event-name", "cloudwatch event name").Required().String(),
+		ScheduleExpression: schedule.Flag("schedule-exp", "cloudwatch event schdule expression").Required().String(),
+		RoleArn:            schedule.Flag("role-arn", "cloudwatch event role arn").Required().String(),
+	}
+
 	sub := kingpin.Parse()
 	if sub == "version" {
 		fmt.Println("ecspresso", Version)
@@ -151,6 +162,8 @@ func _main() int {
 		err = app.Register(registerOption)
 	case "init":
 		err = app.Init(initOption)
+	case "schedule":
+		err = app.Schedule(scheduleOption)
 	default:
 		kingpin.Usage()
 		return 1

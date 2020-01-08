@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/applicationautoscaling"
+	"github.com/aws/aws-sdk-go/service/cloudwatchevents"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go/service/codedeploy"
 	"github.com/aws/aws-sdk-go/service/ecs"
@@ -41,6 +42,7 @@ type App struct {
 	autoScaling *applicationautoscaling.ApplicationAutoScaling
 	codedeploy  *codedeploy.CodeDeploy
 	cwl         *cloudwatchlogs.CloudWatchLogs
+	cwe         *cloudwatchevents.CloudWatchEvents
 	Service     string
 	Cluster     string
 	config      *Config
@@ -246,6 +248,7 @@ func NewApp(conf *Config) (*App, error) {
 		autoScaling: applicationautoscaling.New(sess),
 		codedeploy:  codedeploy.New(sess),
 		cwl:         cloudwatchlogs.New(sess),
+		cwe:         cloudwatchevents.New(sess),
 		config:      conf,
 	}
 	return d, nil
@@ -747,6 +750,141 @@ func (d *App) suspendAutoScaling(suspend bool) error {
 		if err != nil {
 			return errors.Wrap(err, fmt.Sprintf("failed to register scalable target %s set suspend to %t", *target.ResourceId, suspend))
 		}
+	}
+	return nil
+}
+
+func (d *App) Schedule(opt ScheduleOption) error {
+	ctx, cancel := d.Start()
+	defer cancel()
+
+	d.Log("Schedule task", opt.DryRunString())
+	var ov ecs.TaskOverride
+	if ovStr := *opt.TaskOverrideStr; ovStr != "" {
+		if err := json.Unmarshal([]byte(ovStr), &ov); err != nil {
+			return errors.Wrap(err, "invalid overrides")
+		}
+	}
+
+	sv, err := d.DescribeServiceStatus(ctx, 0)
+	if err != nil {
+		return errors.Wrap(err, "failed to describe service status")
+	}
+
+	var tdArn string
+
+	if *opt.SkipTaskDefinition {
+		td, err := d.DescribeTaskDefinition(ctx, *sv.TaskDefinition)
+		if err != nil {
+			return errors.Wrap(err, "failed to describe task definition")
+		}
+		tdArn = *(td.TaskDefinitionArn)
+		if *opt.DryRun {
+			d.Log("task definition:", td.String())
+		}
+	} else {
+		td, err := d.LoadTaskDefinition(d.config.TaskDefinitionPath)
+		if err != nil {
+			return errors.Wrap(err, "failed to load task definition")
+		}
+
+		if len(*opt.TaskDefinition) > 0 {
+			d.Log("Loading task definition")
+			runTd, err := d.LoadTaskDefinition(*opt.TaskDefinition)
+			if err != nil {
+				return errors.Wrap(err, "failed to load task definition")
+			}
+			td = runTd
+		}
+
+		var newTd *ecs.TaskDefinition
+		_ = newTd
+
+		if *opt.DryRun {
+			d.Log("task definition:", td.String())
+		} else {
+			newTd, err = d.RegisterTaskDefinition(ctx, td)
+			if err != nil {
+				return errors.Wrap(err, "failed to register task definition")
+			}
+			tdArn = *newTd.TaskDefinitionArn
+		}
+	}
+
+	if *opt.DryRun {
+		d.Log("DRY RUN OK")
+		return nil
+	}
+
+	err = d.ScheduleTask(ctx, tdArn, *opt.RoleArn, sv, &ov, *opt.EventName, *opt.ScheduleExpression)
+	if err != nil {
+		return err
+	}
+
+	d.Log("Scheduled task!")
+
+	return nil
+}
+
+func toCweNetworkConfiguration(nc *ecs.NetworkConfiguration) *cloudwatchevents.NetworkConfiguration {
+	if nc == nil {
+		return nil
+	}
+
+	var vpcConf *cloudwatchevents.AwsVpcConfiguration
+	if nc.AwsvpcConfiguration != nil {
+		vpcConf = &cloudwatchevents.AwsVpcConfiguration{
+			AssignPublicIp: nc.AwsvpcConfiguration.AssignPublicIp,
+			SecurityGroups: nc.AwsvpcConfiguration.SecurityGroups,
+			Subnets:        nc.AwsvpcConfiguration.Subnets,
+		}
+	}
+	return &cloudwatchevents.NetworkConfiguration{
+		AwsvpcConfiguration: vpcConf,
+	}
+}
+
+func (d *App) ScheduleTask(ctx context.Context, tdArn string, roleArn string, sv *ecs.Service, ov *ecs.TaskOverride, name string, scheduleExp string) error {
+	in := &cloudwatchevents.PutRuleInput{
+		Name:               aws.String(name),
+		ScheduleExpression: aws.String(scheduleExp),
+	}
+	rule, err := d.cwe.PutRuleWithContext(ctx, in)
+	if err != nil {
+		return err
+	}
+
+	d.Log("Rule ARN:", *rule.RuleArn)
+
+	var input *string
+	if ov != nil {
+		j, err := MarshalJSON(ov)
+		if err != nil {
+			return err
+		}
+		input = aws.String(string(j))
+	}
+	t := &cloudwatchevents.PutTargetsInput{
+		Rule: aws.String(name),
+		Targets: []*cloudwatchevents.Target{
+			&cloudwatchevents.Target{
+				Arn:     sv.ClusterArn,
+				RoleArn: aws.String(roleArn),
+				Id:      aws.String(fmt.Sprintf("%v-ecs", name)),
+				EcsParameters: &cloudwatchevents.EcsParameters{
+					LaunchType:           sv.LaunchType,
+					NetworkConfiguration: toCweNetworkConfiguration(sv.NetworkConfiguration),
+					TaskDefinitionArn:    aws.String(tdArn),
+					TaskCount:            aws.Int64(1),
+				},
+				Input: input,
+			},
+		},
+	}
+	_, err = d.cwe.PutTargetsWithContext(ctx, t)
+
+	if err != nil {
+		return err
 	}
 	return nil
 }

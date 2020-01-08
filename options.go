@@ -105,3 +105,20 @@ type InitOption struct {
 	ServiceDefinitionPath *string
 	ConfigFilePath        *string
 }
+
+type ScheduleOption struct {
+	DryRun             *bool
+	TaskDefinition     *string
+	TaskOverrideStr    *string
+	SkipTaskDefinition *bool
+	EventName          *string
+	ScheduleExpression *string
+	RoleArn            *string
+}
+
+func (opt ScheduleOption) DryRunString() string {
+	if *opt.DryRun {
+		return dryRunStr
+	}
+	return ""
+}
